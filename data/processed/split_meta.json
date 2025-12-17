@@ -1,0 +1,9 @@
+{
+  "seed": 42,
+  "test_size": 0.2,
+  "target": "Revenue",
+  "train_positive_rate": 0.15470397404703973,
+  "test_positive_rate": 0.1549067315490673,
+  "n_train": 9864,
+  "n_test": 2466
+}
