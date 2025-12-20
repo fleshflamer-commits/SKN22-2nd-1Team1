@@ -24,7 +24,7 @@ from adapters.purchase_intent_pr_auc_adapter import PurchaseIntentPRAUCModelAdap
 @st.cache_resource
 def init_service():
     model_path = "artifacts/best_pr_auc_balancedrf.joblib"
-    adapter = PurchaseIntentPRAUCModelAdapter(model_path) 
+    adapter = PurchaseIntentPRAUCModelAdapter(model_path)
     return PurchaseIntentService(adapter), adapter
 
 @st.cache_data
@@ -34,47 +34,145 @@ def load_data():
 service, adapter = init_service()
 df = load_data()
 
+# =========================================================
+# [추가] 개발 중 코드/메시지 변경이 반영 안 될 때를 대비한 캐시 초기화 버튼
+# - st.cache_resource 때문에 "서비스 객체"가 오래 살아남아
+#   수정한 recommend_action이 즉시 반영되지 않는 경우가 있음
+# =========================================================
+with st.sidebar:
+    if st.button("캐시 초기화(개발용)"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+# =========================================================
+
+# =========================================================
+# [기존 유지] 상태명 매핑
+# =========================================================
+RISK_NAME_MAP = {
+    "HIGH_RISK": "고위험 이탈군",
+    "OPPORTUNITY": "전환 기회군",
+    "LIKELY_BUYER": "구매 유력군",
+}
+
+# =========================================================
+# [기존 유지] 전체 데이터에 대해 구매확률/위험등급 계산
+# =========================================================
+@st.cache_data
+def compute_scores(df_all: pd.DataFrame) -> pd.DataFrame:
+    X_all = df_all.drop(columns=["Revenue"], errors="ignore")
+    proba_series = adapter.predict_proba(X_all)
+
+    if hasattr(proba_series, "values"):
+        proba_values = proba_series.values
+        idx_values = df_all.index
+        proba_s = pd.Series(proba_values, index=idx_values, name="purchase_proba")
+    else:
+        proba_s = pd.Series(proba_series, index=df_all.index, name="purchase_proba")
+
+    risk_codes = proba_s.apply(lambda p: service.classify_risk(float(p)))
+
+    score_df = pd.DataFrame({
+        "purchase_proba": proba_s,
+        "risk_code": risk_codes
+    }, index=df_all.index)
+
+    return score_df
+
+# =========================================================
+# [기존 유지] "고위험 5 / 기회 3 / 유력 2"로 10개 세션 선정
+# =========================================================
+def select_10_sessions(score_df: pd.DataFrame) -> list[int]:
+    high_needed, opp_needed, likely_needed = 5, 3, 2
+
+    high_df = score_df[score_df["risk_code"] == "HIGH_RISK"].sort_values("purchase_proba", ascending=True)
+    opp_df = score_df[score_df["risk_code"] == "OPPORTUNITY"].sort_values("purchase_proba", ascending=False)
+    likely_df = score_df[score_df["risk_code"] == "LIKELY_BUYER"].sort_values("purchase_proba", ascending=False)
+
+    selected_idx = []
+    selected_idx += list(high_df.head(high_needed).index)
+    selected_idx += list(opp_df.head(opp_needed).index)
+    selected_idx += list(likely_df.head(likely_needed).index)
+
+    if len(selected_idx) < 10:
+        remaining = score_df.drop(index=selected_idx, errors="ignore").sort_values("purchase_proba", ascending=False)
+        need = 10 - len(selected_idx)
+        selected_idx += list(remaining.head(need).index)
+
+    return selected_idx[:10]
+
+# =========================================================
+# [기존 유지] 드롭다운 라벨 생성
+# [수정] label -> group_id(1~10) 매핑을 추가로 만든다
+# =========================================================
+score_df = compute_scores(df)
+selected_idx_list = select_10_sessions(score_df)
+
+df_selected = df.loc[selected_idx_list].copy()
+score_selected = score_df.loc[selected_idx_list]
+
+group_label_map = {}  # label -> real_idx
+group_id_map = {}     # [수정/추가] label -> group_id(1~10)
+
+for i, real_idx in enumerate(df_selected.index, start=1):
+    risk_code = score_selected.loc[real_idx, "risk_code"]
+    risk_name = RISK_NAME_MAP.get(risk_code, "관찰 필요")
+    label = f"그룹{i}({risk_name})"
+
+    group_label_map[label] = real_idx
+    group_id_map[label] = i  # [수정/추가] 핵심: UI 그룹번호를 저장
+
 # --- [STEP 4] UI 레이아웃 설정 ---
 render_header()
 st.title("🛡️ 고객 이탈 방지 및 마케팅 전략 가이드")
 
-# 좌우 레이아웃 분할 (비율 4:6)
 left_col, right_col = st.columns([4, 6])
 
 with left_col:
     st.subheader("📝 세션 정보 입력")
-    # 분석할 고객 세션을 상위 10개만 슬라이싱하여 표시하도록 수정
-    idx = st.selectbox("분석할 고객 세션 선택", df.index[:10], key="session_select")
+
+    selected_label = st.selectbox(
+        "분석할 고객 세션 선택",
+        options=list(group_label_map.keys()),
+        key="session_select_group"
+    )
+
+    idx = group_label_map[selected_label]
+    selected_group_id = group_id_map[selected_label]  # [수정/추가] 선택된 그룹번호(1~10)
+
     row = df.loc[idx]
-    
+
     st.write("---")
     st.write("**📍 주요 행동 지표**")
     st.write(f"- 페이지 가치: `{row.get('PageValues', 0):.2f}`")
     st.write(f"- 이탈률: `{row.get('BounceRates', 0)*100:.1f}%`")
     st.write(f"- 체류 시간: `{row.get('ProductRelated_Duration', 0):.0f}초`")
-    
-    # 예측 수행 준비
+
     X_one = pd.DataFrame([row.drop("Revenue", errors="ignore")])
-    proba = adapter.predict_proba(X_one).iloc[0]
+    proba = float(adapter.predict_proba(X_one).iloc[0])
     risk = service.classify_risk(proba)
-    action = service.recommend_action(row.to_dict(), proba)
+
+    # =========================================================
+    # [수정] group_id(1~10)를 recommend_action에 전달
+    # - 이제 그룹 선택에 따라 10종 메시지가 1:1로 바뀜
+    # =========================================================
+    action = service.recommend_action(row.to_dict(), proba, group_id=selected_group_id)
 
 with right_col:
     st.subheader("📊 분석 결과 및 시각화")
-    
-    # [그래프 표현] Plotly 게이지 차트 생성
+
     fig = go.Figure(go.Indicator(
-        mode = "gauge+number",
-        value = proba * 100,
-        domain = {'x': [0, 1], 'y': [0, 1]},
-        title = {'text': "구매 전환 확률 (%)", 'font': {'size': 20}},
-        gauge = {
+        mode="gauge+number",
+        value=proba * 100,
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': "구매 전환 확률 (%)", 'font': {'size': 20}},
+        gauge={
             'axis': {'range': [None, 100], 'tickwidth': 1},
             'bar': {'color': "#1f77b4"},
             'steps': [
-                {'range': [0, 20], 'color': "#ff4b4b"},  # HIGH RISK 영역
-                {'range': [20, 60], 'color': "#ffa500"}, # OPPORTUNITY 영역
-                {'range': [60, 100], 'color': "#28a745"} # LIKELY BUYER 영역
+                {'range': [0, 20], 'color': "#ff4b4b"},
+                {'range': [20, 60], 'color': "#ffa500"},
+                {'range': [60, 100], 'color': "#28a745"}
             ],
             'threshold': {
                 'line': {'color': "white", 'width': 4},
@@ -86,7 +184,6 @@ with right_col:
     fig.update_layout(height=350, margin=dict(l=20, r=20, t=50, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-    # 상태 및 액션 카드
     if risk == "HIGH_RISK":
         st.error(f"🚨 **상태: 고위험 이탈군** (확률: {proba*100:.1f}%)")
     elif risk == "OPPORTUNITY":
@@ -96,22 +193,24 @@ with right_col:
 
     st.info(f"💡 **추천 마케팅 액션:**\n\n{action}")
 
-# 하단 추가 정보 (선택 사항)
+with st.expander("ℹ️ 분석 기준 및 타겟팅 로직 안내"):
+    st.markdown("""
+    **분석 대상 선정 기준(총 10개 세션):**
+    * **전체 예측 기반 샘플링**: 테스트 데이터(`test.csv`) 전체 세션에 대해 모델이 **구매 전환 확률(purchase_proba)** 을 계산합니다.
+    * **위험 등급 분류**:
+      - **고위험 이탈군(HIGH_RISK)**: `p < 0.20`
+      - **전환 기회군(OPPORTUNITY)**: `0.20 ≤ p < 0.60`
+      - **구매 유력군(LIKELY_BUYER)**: `p ≥ 0.60`
+    * **그룹 구성 비율(데모용)**: **고위험 5 / 기회 3 / 유력 2**로 총 10개를 제공합니다.
+    * **대표 세션 선정 방식**
+      - 고위험 5개: HIGH_RISK 중 **구매확률이 가장 낮은 5개**
+      - 기회 3개: OPPORTUNITY 중 **구매확률이 가장 높은 3개**
+      - 유력 2개: LIKELY_BUYER 중 **구매확률이 가장 높은 2개**
+    * **중요**: 드롭다운의 “그룹1~10”은 위 규칙으로 뽑힌 **표본의 순번**이며,
+      이 순번(1~10)을 서비스로 전달하여 **10종 메시지를 1:1로 출력**합니다.
+    """)
+
 with st.expander("🔍 상세 세션 데이터 보기"):
     st.dataframe(pd.DataFrame([row]))
 
-
-    # --- [기존 STEP 4 아래에 추가하거나 수정하세요] ---
-
-# [추가] 분석 기준 안내 섹션
-with st.expander("ℹ️ 분석 기준 및 타겟팅 로직 안내"):
-    st.markdown("""
-    **분석 대상 선정 기준:**
-    * **샘플링**: 현재 테스트 데이터(`test.csv`)의 최상위 **10개 세션**을 시뮬레이션 대상으로 선정합니다.
-    * **분류 로직**: 인공지능 모델이 계산한 실시간 **구매 전환 확률**을 기반으로 합니다.
-    * **타겟팅 임계치**: 상위 **5%**(`top_k_ratio=0.05`)의 확률을 가진 세션을 '우선 케어 대상'으로 분류하는 알고리즘이 적용되어 있습니다.
-    """)
-
-st.info("💡 분석 효율을 위해 시스템이 선별한 상위 10개의 주요 타겟 세션을 제공합니다.")
-
-# --- 이하 기존 레이아웃 코드 유지 ---
+st.info("💡 데모 효율을 위해, 모델 예측 기반으로 10개 세션을 (고위험 5 / 기회 3 / 유력 2)로 구성해 제공합니다.")
