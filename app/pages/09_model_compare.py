@@ -9,10 +9,8 @@ from pathlib import Path
 import os
 import platform
 
-# 1. 초기 설정
 render_header()
-# set_page_config는 반드시 최상단에 있어야 함 (render_header 내부에 없다면 유지)
-# st.set_page_config(page_title="model_compare", layout="wide") 
+st.set_page_config(page_title="Model Compare", layout="wide")
 
 # 텐서플로우 체크
 try:
@@ -21,6 +19,7 @@ try:
 except:
     DL_AVAILABLE = False
 
+# 폰트 설정
 def setup_font():
     plt.rcParams['axes.unicode_minus'] = False
     os_name = platform.system()
@@ -30,7 +29,7 @@ def setup_font():
 
 setup_font()
 
-# 2. 자원 로드 함수 (경로 수정 및 방어 로직)
+# 자원 로드
 @st.cache_resource
 def load_all():
     curr_path = Path(__file__).resolve()
@@ -45,6 +44,7 @@ def load_all():
     
     df = pd.read_csv(data_path)
     
+    # 메인 모델
     main_model_file = art_dir / "best_pr_auc_balancedrf.joblib"
     if not main_model_file.exists():
         st.error(f"❌ 모델 파일을 찾을 수 없습니다: {main_model_file}")
@@ -53,6 +53,7 @@ def load_all():
     main_art = joblib.load(main_model_file)
     main_pipe = main_art["pipeline"] if isinstance(main_art, dict) else main_art
     
+    # 비교 모델들
     others = {}
     cat_path = art_dir / "catboost_model.joblib"
     if cat_path.exists():
@@ -65,7 +66,6 @@ def load_all():
         
     return main_pipe, others, df
 
-# 3. 데이터 로딩 실행 및 변수 할당 (이 부분이 에러 해결 핵심!)
 try:
     main_pipe, others, df = load_all()
     preprocessor = main_pipe.named_steps['preprocess']
@@ -77,16 +77,33 @@ except Exception as e:
     st.error(f"🔥 초기화 중 오류 발생: {e}")
     st.stop()
 
-# --- 여기서부터 UI 시작 ---
-st.title("⚔️ Model Comparison & Individual Diagnosis")
+# --- UI 시작 ---
+st.title("⚖️ 모델 비교")
 
 # 1. 개별 고객 진단 섹션
-st.subheader("🕵️‍♂️ 개별 고객 심층 분석")
-row_idx = st.slider("고객 선택 (Index)", 0, 100, 0)
+st.subheader("🕵️‍♂️ 개별 고객 심층 진단")
 
-# 예측 비교
 if df is not None:
-    target_data = df.iloc[[row_idx]].drop(columns=['Revenue'], errors='ignore')
+    max_idx = len(df) - 1
+    
+    # 검색창 (Number Input)
+    col_input, col_info = st.columns([1, 3])
+    with col_input:
+        row_idx = st.number_input(
+            "고객 ID 검색 (Index)", 
+            min_value=0, 
+            max_value=max_idx, 
+            value=0, 
+            step=1,
+            help=f"0부터 {max_idx} 사이의 정수를 입력하세요."
+        )
+    with col_info:
+        st.info(f"📊 전체 고객 수: **{len(df)}명** (0 ~ {max_idx}번)")
+
+    # 선택된 고객 데이터 가져오기
+    target_row = df.iloc[[row_idx]].drop(columns=['Revenue'], errors='ignore')
+    
+    # 모든 모델 예측값 출력
     all_m = {"Balanced RF (Main)": main_pipe}
     all_m.update(others)
 
@@ -95,11 +112,11 @@ if df is not None:
         with cols[i]:
             try:
                 if "Deep Learning" in name:
-                    input_dl = preprocessor.transform(target_data)
+                    input_dl = preprocessor.transform(target_row)
                     if hasattr(input_dl, "toarray"): input_dl = input_dl.toarray()
                     prob = float(m.predict(input_dl, verbose=0)[0][0])
                 else:
-                    prob = m.predict_proba(target_data)[0, 1]
+                    prob = m.predict_proba(target_row)[0, 1]
                 
                 st.metric(name, f"{prob:.1%}")
                 
@@ -109,34 +126,47 @@ if df is not None:
                     st.error("📉 이탈 (No Buy)")
                     
             except Exception as e:
-                st.error("예측 불가")
+                st.warning("예측 불가")
 
-    # Waterfall Plot
-    st.write("#### 💡 해당 고객의 구매 판단 근거")
+    # Waterfall Plot (개별 분석)
+    st.divider()
+    st.write(f"#### 💡 Index {row_idx}번 고객의 구매/이탈 판단 근거 (Waterfall)")
     
-    # 다크모드 그래프 설정
+    # [수정된 부분] 선택된 고객 1명만 SHAP 계산 (에러 해결 핵심)
     plt.style.use('dark_background')
     fig = plt.figure(figsize=(10, 6), facecolor='#0E1117')
 
-    X_trans = preprocessor.transform(df.drop(columns=['Revenue'], errors='ignore').iloc[:100])
-    if hasattr(X_trans, "toarray"): X_trans = X_trans.toarray()
-    X_df = pd.DataFrame(X_trans, columns=feature_names)
+    # 1. Explainer 초기화용 배경 데이터 (빠른 속도를 위해 100개만 사용)
+    X_background = preprocessor.transform(df.drop(columns=['Revenue'], errors='ignore').iloc[:100])
+    if hasattr(X_background, "toarray"): X_background = X_background.toarray()
+    X_bg_df = pd.DataFrame(X_background, columns=feature_names)
+    
+    explainer = shap.Explainer(main_model, X_bg_df)
 
-    explainer = shap.Explainer(main_model, X_df)
-    shap_obj = explainer(X_df)
+    # 2. 실제 분석 대상 (선택된 고객 1명) 전처리
+    target_processed = preprocessor.transform(target_row)
+    if hasattr(target_processed, "toarray"): target_processed = target_processed.toarray()
+    target_df = pd.DataFrame(target_processed, columns=feature_names)
 
+    # 3. SHAP 계산 (1명 분량)
+    shap_obj = explainer(target_df)
+
+    # 4. 그리기 (1명분이므로 인덱스는 항상 0)
     if len(shap_obj.shape) == 3:
-        shap.plots.waterfall(shap_obj[row_idx, :, 1], show=False)
+        # (샘플수, 피처수, 클래스수) 구조인 경우 -> Class 1(구매) 기준
+        shap.plots.waterfall(shap_obj[0, :, 1], show=False)
     else:
-        shap.plots.waterfall(shap_obj[row_idx], show=False)
+        # (샘플수, 피처수) 구조인 경우
+        shap.plots.waterfall(shap_obj[0], show=False)
 
-    # 마이너스 깨짐 및 텍스트 색상 보정
+    # 텍스트 및 디자인 보정
     for text in fig.findobj(match=plt.Text):
         t = text.get_text()
         if '−' in t: text.set_text(t.replace('−', '-'))
         text.set_color('white')
 
     for ax in fig.get_axes():
+        ax.set_facecolor('#0E1117')
         ax.tick_params(axis='both', colors='white')
         ax.set_yticklabels([label.get_text().replace('−', '-') for label in ax.get_yticklabels()], color='white')
         ax.set_xticklabels([label.get_text().replace('−', '-') for label in ax.get_xticklabels()], color='white')
