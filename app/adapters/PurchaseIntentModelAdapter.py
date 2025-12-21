@@ -33,15 +33,45 @@ class PurchaseIntentModelAdapter:
             raise FileNotFoundError(f"Model artifact not found: {self._model_path}")
 
         raw = joblib.load(self._model_path)
+        
+        pipeline = None
+        best_threshold = 0.5
+        meta = {}
 
-        # 우리가 저장한 형태: {"pipeline": ..., "best_threshold": ..., ...}
-        if "pipeline" not in raw or "best_threshold" not in raw:
-            raise ValueError("Invalid artifact format: expected keys ['pipeline', 'best_threshold'].")
+        # Case 1: The loaded object is the pipeline itself (legacy support)
+        if hasattr(raw, "predict_proba"):
+            pipeline = raw
+            # Try to infer meta if possible, otherwise empty
+        
+        # Case 2: It is a dictionary
+        elif isinstance(raw, dict):
+            # Try to find pipeline
+            if "pipeline" in raw:
+                pipeline = raw["pipeline"]
+            else:
+                # Search for any value that looks like a model
+                for k, v in raw.items():
+                    if hasattr(v, "predict_proba"):
+                        pipeline = v
+                        break
+            
+            # Try to find threshold
+            if "best_threshold" in raw:
+                best_threshold = float(raw["best_threshold"])
+            
+            # Store everything else as meta
+            meta = {k: v for k, v in raw.items() if k not in ("pipeline", "best_threshold")}
+
+        if pipeline is None:
+            raise ValueError(
+                f"Invalid artifact format in {self._model_path}. "
+                "Could not find a valid pipeline model with 'predict_proba'."
+            )
 
         self._artifact = ModelArtifact(
-            pipeline=raw["pipeline"],
-            best_threshold=float(raw["best_threshold"]),
-            meta={k: v for k, v in raw.items() if k not in ("pipeline", "best_threshold")},
+            pipeline=pipeline,
+            best_threshold=best_threshold,
+            meta=meta,
         )
         return self._artifact
 
