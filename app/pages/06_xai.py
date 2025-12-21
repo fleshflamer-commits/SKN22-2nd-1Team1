@@ -78,7 +78,7 @@ except Exception as e:
     st.error(f"초기화 중 오류 발생: {e}")
     st.stop() # 여기서 멈춰야 아래 코드에서 model 관련 에러가 안 납니다.
 
-st.title("🧠 AI Model Explainability (XAI)")
+st.title("🧠 모델 해석 (XAI)")
 st.markdown("모델이 어떤 기준으로 구매 여부를 판단하는지 분석합니다.")
 
 tab1, tab2 = st.tabs(["Global Importance", "Summary Analysis"])
